@@ -2,6 +2,7 @@
   "name": "react-tailwind-to-vanilla-converter",
   "version": "1.1.0",
   "description": "Dependency-free web app that converts React + Tailwind repos into plain HTML/CSS/JS",
+  "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
