@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>React + Tailwind to Vanilla Converter</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <h1>React + Tailwind to Vanilla Converter</h1>
+      <p class="description">
+        Enter a public GitHub repository URL. The app will fetch source files, convert JSX and
+        Tailwind classes, and build standalone HTML/CSS/JS.
+      </p>
+
+      <form id="convert-form">
+        <label for="repo-url">GitHub repository URL</label>
+        <div class="row">
+          <input id="repo-url" type="url" placeholder="https://github.com/owner/repo" required />
+          <button type="submit">Convert</button>
+        </div>
+      </form>
+
+      <div id="status" class="status"></div>
+
+      <div class="actions">
+        <button id="download-btn" type="button" disabled>Download ZIP</button>
+      </div>
+
+      <section>
+        <h2>Live Preview</h2>
+        <iframe id="preview-frame" title="Converted website preview"></iframe>
+      </section>
+
+      <section class="code-grid">
+        <article>
+          <h3>index.html</h3>
+          <pre id="html-output"></pre>
+        </article>
+        <article>
+          <h3>styles.css</h3>
+          <pre id="css-output"></pre>
+        </article>
+        <article>
+          <h3>script.js</h3>
+          <pre id="js-output"></pre>
+        </article>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
