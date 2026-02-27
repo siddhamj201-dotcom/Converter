@@ -1,0 +1,20 @@
+{
+  "name": "react-tailwind-to-vanilla-converter",
+  "version": "1.0.0",
+  "description": "Web app that converts React + Tailwind repos into plain HTML/CSS/JS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@babel/generator": "^7.26.10",
+    "@babel/parser": "^7.26.10",
+    "@babel/traverse": "^7.26.10",
+    "adm-zip": "^0.5.16",
+    "express": "^4.21.2",
+    "jszip": "^3.10.1",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.13"
+  }
+}
