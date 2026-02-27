@@ -1,254 +1,149 @@
 const path = require('path');
 const os = require('os');
 const fs = require('fs/promises');
-const AdmZip = require('adm-zip');
-const parser = require('@babel/parser');
-const traverse = require('@babel/traverse').default;
-const generate = require('@babel/generator').default;
-const postcss = require('postcss');
-const tailwindcss = require('tailwindcss');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const { generateCssFromTailwindClasses } = require('./tailwindToCss');
 
-/**
- * Parse a GitHub URL and extract owner + repo name.
- */
-function parseGitHubUrl(repoUrl) {
+const execFileAsync = promisify(execFile);
+
+/** Parse repo URL or local path */
+function parseRepoInput(repoUrl) {
+  if (repoUrl.startsWith('file://')) {
+    return { type: 'local', path: decodeURIComponent(repoUrl.replace('file://', '')) };
+  }
+  if (repoUrl.startsWith('/')) {
+    return { type: 'local', path: repoUrl };
+  }
   const url = new URL(repoUrl);
-  if (url.hostname !== 'github.com') {
-    throw new Error('Only github.com repositories are supported.');
-  }
-
+  if (url.hostname !== 'github.com') throw new Error('Only github.com URLs are supported (or use file:// for local testing).');
   const [owner, repo] = url.pathname.split('/').filter(Boolean);
-  if (!owner || !repo) {
-    throw new Error('Invalid GitHub repository URL.');
-  }
-
-  return { owner, repo: repo.replace(/\.git$/, '') };
+  if (!owner || !repo) throw new Error('Invalid GitHub repository URL.');
+  return { type: 'github', owner, repo: repo.replace(/\.git$/, '') };
 }
 
-/**
- * Download and unzip a GitHub repository into a temporary directory.
- */
-async function downloadRepository(repoUrl) {
-  const { owner, repo } = parseGitHubUrl(repoUrl);
-  const zipUrl = `https://codeload.github.com/${owner}/${repo}/zip/refs/heads/main`;
+/** Download + extract GitHub repo into a temporary folder */
+async function downloadAndExtractRepository(owner, repo) {
+  const branches = ['main', 'master'];
+  for (const branch of branches) {
+    const zipUrl = `https://codeload.github.com/${owner}/${repo}/zip/refs/heads/${branch}`;
+    const response = await fetch(zipUrl);
+    if (!response.ok) continue;
 
-  // Try `main` first. If it fails, fallback to `master`.
-  let response = await fetch(zipUrl);
-  if (!response.ok) {
-    const fallbackUrl = `https://codeload.github.com/${owner}/${repo}/zip/refs/heads/master`;
-    response = await fetch(fallbackUrl);
+    const zipBuffer = Buffer.from(await response.arrayBuffer());
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'converter-'));
+    const zipPath = path.join(workDir, `${repo}.zip`);
+    await fs.writeFile(zipPath, zipBuffer);
+
+    try {
+      await execFileAsync('unzip', ['-q', zipPath, '-d', workDir]);
+      const entries = await fs.readdir(workDir, { withFileTypes: true });
+      const rootDir = entries.find((entry) => entry.isDirectory() && entry.name !== '__MACOSX');
+      if (!rootDir) throw new Error('Extracted archive is empty.');
+      return { projectDir: path.join(workDir, rootDir.name), cleanupDir: workDir };
+    } catch {
+      await fs.rm(workDir, { recursive: true, force: true });
+      throw new Error('Could not extract repository archive. Ensure `unzip` is installed.');
+    }
   }
-
-  if (!response.ok) {
-    throw new Error('Failed to download repository. Ensure the repo exists and is public.');
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const zipPath = path.join(os.tmpdir(), `repo-${Date.now()}.zip`);
-  const extractDir = path.join(os.tmpdir(), `repo-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-
-  await fs.writeFile(zipPath, Buffer.from(arrayBuffer));
-  await fs.mkdir(extractDir, { recursive: true });
-
-  const zip = new AdmZip(zipPath);
-  zip.extractAllTo(extractDir, true);
-
-  const [rootFolder] = await fs.readdir(extractDir);
-  const projectPath = path.join(extractDir, rootFolder);
-
-  return { projectPath, cleanupPaths: [zipPath, extractDir] };
+  throw new Error('Failed to download repository archive. Check repository URL and visibility.');
 }
 
-async function walkFiles(dir, acc = []) {
+/** Recursively walk project files and collect .js/.jsx/.ts/.tsx files */
+async function walkFiles(dir, out = []) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
-
   for (const entry of entries) {
-    if (['node_modules', '.git', 'dist', 'build'].includes(entry.name)) {
-      continue;
-    }
-
+    if (['node_modules', '.git', 'dist', 'build'].includes(entry.name)) continue;
     const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      await walkFiles(fullPath, acc);
-    } else {
-      acc.push(fullPath);
-    }
+    if (entry.isDirectory()) await walkFiles(fullPath, out);
+    else if (/\.(jsx?|tsx?)$/.test(entry.name)) out.push(fullPath);
   }
-
-  return acc;
+  return out;
 }
 
-function jsxNameToTag(nameNode) {
-  if (!nameNode) return 'div';
-  if (nameNode.type === 'JSXIdentifier') return nameNode.name;
-  if (nameNode.type === 'JSXMemberExpression') return `${jsxNameToTag(nameNode.object)}.${jsxNameToTag(nameNode.property)}`;
-  return 'div';
+/** Extract JSX returned from React component */
+function findReturnJsx(source) {
+  const start = source.indexOf('return (');
+  if (start === -1) return null;
+  let index = start + 'return ('.length;
+  let depth = 1;
+  while (index < source.length && depth > 0) {
+    const char = source[index];
+    if (char === '(') depth += 1;
+    if (char === ')') depth -= 1;
+    index += 1;
+  }
+  if (depth !== 0) return null;
+  return source.slice(start + 'return ('.length, index - 1).trim();
 }
 
-function expressionToJs(exprNode) {
-  return generate(exprNode).code;
+/** Convert JSX string to plain HTML, preserving dynamic expressions as comments */
+function cleanJsxToHtml(jsx) {
+  return jsx
+    .replace(/className=/g, 'class=')
+    .replace(/\s+on[A-Z][a-zA-Z]+=("[^"]*"|\{[^}]*\})/g, '')
+    .replace(/\{\/\*([\s\S]*?)\*\/\}/g, (_, c) => `<!-- ${c.trim()} -->`)
+    .replace(/\{([^{}]+)\}/g, (_, c) => `<!-- dynamic: ${c.trim()} -->`);
 }
 
-function jsxAttrToHtml(attr) {
-  if (!attr || attr.type !== 'JSXAttribute') return null;
-  const attrName = attr.name.name === 'className' ? 'class' : attr.name.name;
-
-  if (!attr.value) return `${attrName}`;
-
-  if (attr.value.type === 'StringLiteral') {
-    return `${attrName}="${attr.value.value}"`;
-  }
-
-  if (attr.value.type === 'JSXExpressionContainer') {
-    const code = expressionToJs(attr.value.expression);
-    return `${attrName}="${code}"`;
-  }
-
-  return null;
+/** Extract helper JS logic (non-React, non-hooks) */
+function extractJsLogic(source) {
+  const lines = source
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('import '))
+    .filter((line) => !line.trim().startsWith('export default'))
+    .filter((line) => !line.includes('useState(') && !line.includes('useEffect('));
+  const block = lines.join('\n').trim();
+  return block.length ? block : null;
 }
 
-/**
- * Convert JSX AST node to plain HTML string.
- * Dynamic JSX expressions are preserved as data attributes/comments
- * so the output stays readable and debuggable.
- */
-function jsxNodeToHtml(node) {
-  if (!node) return '';
-
-  if (node.type === 'JSXText') {
-    return node.value;
-  }
-
-  if (node.type === 'JSXExpressionContainer') {
-    const code = expressionToJs(node.expression);
-    return `<!-- dynamic: ${code} -->`;
-  }
-
-  if (node.type === 'JSXFragment') {
-    return node.children.map(jsxNodeToHtml).join('');
-  }
-
-  if (node.type === 'JSXElement') {
-    const tag = jsxNameToTag(node.openingElement.name);
-    const attrs = node.openingElement.attributes
-      .filter((a) => a.type === 'JSXAttribute')
-      .map(jsxAttrToHtml)
-      .filter(Boolean)
-      .join(' ');
-
-    const children = node.children.map(jsxNodeToHtml).join('');
-    const opening = attrs ? `<${tag} ${attrs}>` : `<${tag}>`;
-    return `${opening}${children}</${tag}>`;
-  }
-
-  return '';
-}
-
-function collectTailwindClassesFromHtml(html) {
-  const classRegex = /class\s*=\s*"([^"]+)"/g;
+/** Collect all classes from HTML */
+function collectClasses(html) {
   const classes = new Set();
+  const regex = /class\s*=\s*"([^"]+)"/g;
   let match;
-
-  while ((match = classRegex.exec(html))) {
-    match[1]
-      .split(/\s+/)
-      .filter(Boolean)
-      .forEach((cls) => classes.add(cls));
+  while ((match = regex.exec(html))) {
+    match[1].split(/\s+/).filter(Boolean).forEach((c) => classes.add(c));
   }
-
-  return Array.from(classes);
+  return classes;
 }
 
-async function generateTailwindCss(classes) {
-  const rawContent = `<div class="${classes.join(' ')}"></div>`;
-
-  const result = await postcss([
-    tailwindcss({
-      content: [{ raw: rawContent, extension: 'html' }],
-      corePlugins: { preflight: false }
-    })
-  ]).process('@tailwind utilities;', { from: undefined });
-
-  return `/* Generated from Tailwind classes found in source files */\n${result.css}`;
-}
-
-function extractComponentReturn(ast) {
-  let returnedJsx = null;
-
-  traverse(ast, {
-    ReturnStatement(path) {
-      if (returnedJsx || !path.node.argument) return;
-      const arg = path.node.argument;
-      if (arg.type === 'JSXElement' || arg.type === 'JSXFragment') {
-        returnedJsx = arg;
-      }
-    }
-  });
-
-  return returnedJsx;
-}
-
-function extractImperativeLogic(ast) {
-  const logicBlocks = [];
-
-  traverse(ast, {
-    FunctionDeclaration(path) {
-      // Skip likely component declarations (PascalCase), keep helpers.
-      const name = path.node.id?.name || '';
-      if (/^[A-Z]/.test(name)) return;
-      logicBlocks.push(generate(path.node).code);
-    },
-    VariableDeclaration(path) {
-      const declarationCode = generate(path.node).code;
-      if (/useState|useEffect|jsx|React/.test(declarationCode)) return;
-      logicBlocks.push(declarationCode);
-    }
-  });
-
-  return logicBlocks;
-}
-
+/** Main repository conversion */
 async function convertRepository(repoUrl) {
-  const { projectPath, cleanupPaths } = await downloadRepository(repoUrl);
+  const parsed = parseRepoInput(repoUrl);
+  let projectDir;
+  let cleanupDir = null;
+
+  if (parsed.type === 'github') {
+    const downloaded = await downloadAndExtractRepository(parsed.owner, parsed.repo);
+    projectDir = downloaded.projectDir;
+    cleanupDir = downloaded.cleanupDir;
+  } else {
+    projectDir = parsed.path;
+  }
 
   try {
-    const files = await walkFiles(projectPath);
-    const reactFiles = files.filter((file) => /\.(jsx?|tsx?)$/.test(file));
-
+    const files = await walkFiles(projectDir);
     const htmlSections = [];
     const jsSections = [];
     const allClasses = new Set();
 
-    for (const file of reactFiles) {
-      const source = await fs.readFile(file, 'utf8');
-      if (!source.includes('<') || !source.includes('>')) continue;
-
-      let ast;
-      try {
-        ast = parser.parse(source, {
-          sourceType: 'module',
-          plugins: ['jsx']
-        });
-      } catch {
-        continue;
+    for (const filePath of files) {
+      const source = await fs.readFile(filePath, 'utf8');
+      const jsx = findReturnJsx(source);
+      if (jsx) {
+        const html = cleanJsxToHtml(jsx);
+        htmlSections.push(`<!-- Source: ${path.relative(projectDir, filePath)} -->\n${html}`);
+        collectClasses(html).forEach((c) => allClasses.add(c));
       }
 
-      const returnedJsx = extractComponentReturn(ast);
-      if (returnedJsx) {
-        const html = jsxNodeToHtml(returnedJsx);
-        htmlSections.push(`<!-- Source: ${path.relative(projectPath, file)} -->\n${html}`);
-        collectTailwindClassesFromHtml(html).forEach((cls) => allClasses.add(cls));
-      }
-
-      const logicBlocks = extractImperativeLogic(ast);
-      if (logicBlocks.length) {
-        jsSections.push(`// Source: ${path.relative(projectPath, file)}\n${logicBlocks.join('\n\n')}`);
-      }
+      const js = extractJsLogic(source);
+      if (js) jsSections.push(`// Source: ${path.relative(projectDir, filePath)}\n${js}`);
     }
 
-    const css = await generateTailwindCss(Array.from(allClasses));
-
-    const htmlOutput = `<!doctype html>
+    return {
+      files: {
+        'index.html': `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -257,38 +152,24 @@ async function convertRepository(repoUrl) {
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <!-- Combined static HTML generated from React component return blocks -->
     <main id="app">
-${htmlSections.join('\n\n') || '      <p>No JSX components could be converted.</p>'}
+${htmlSections.join('\n\n') || '      <p>No JSX return blocks found.</p>'}
     </main>
-
     <script src="script.js"></script>
   </body>
-</html>`;
-
-    const jsOutput = `/**
- * Generated JavaScript extracted from non-React helper logic.
- * Dynamic JSX expressions were left as HTML comments in index.html.
- */
-${jsSections.join('\n\n') || '// No reusable JS logic extracted.'}`;
-
-    return {
-      files: {
-        'index.html': htmlOutput,
-        'styles.css': css,
-        'script.js': jsOutput
+</html>`,
+        'styles.css': generateCssFromTailwindClasses(Array.from(allClasses).sort()),
+        'script.js': `/**\n * Extracted JavaScript from source files.\n * Review and clean framework-specific code as needed.\n */\n${jsSections.join('\n\n') || '// No standalone JS logic found.'}`
       },
       metadata: {
-        convertedFiles: reactFiles.length,
-        extractedClasses: allClasses.size
+        convertedFiles: files.length,
+        extractedClasses: allClasses.size,
+        note: 'Tailwind conversion supports a practical subset of utility classes.'
       }
     };
   } finally {
-    // Clean temporary artifacts.
-    for (const target of cleanupPaths) {
-      await fs.rm(target, { recursive: true, force: true });
-    }
+    if (cleanupDir) await fs.rm(cleanupDir, { recursive: true, force: true });
   }
 }
 
-module.exports = { convertRepository };
+module.exports = { convertRepository, parseRepoInput, cleanJsxToHtml, findReturnJsx };
